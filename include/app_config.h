@@ -11,20 +11,20 @@
 
 // Wi-Fi 配置
 #ifndef WIFI_SSID
-#define WIFI_SSID "STARLINK"  // Wi-Fi网络名称
+#define WIFI_SSID "-------"  // Wi-Fi网络名称
 #endif
 
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "A413@j00"  // Wi-Fi密码
+#define WIFI_PASSWORD "-------"  // Wi-Fi密码
 #endif
 
 // 豆包API配置
 #ifndef DOUBAO_APP_ID
-#define DOUBAO_APP_ID "9603609268"  // 豆包应用ID
+#define DOUBAO_APP_ID "-------"  // 豆包应用ID
 #endif
 
 #ifndef DOUBAO_ACCESS_KEY
-#define DOUBAO_ACCESS_KEY "-i32Wp6ERT_osX7WKgp6AkwPXiMBilIi"  // 豆包访问密钥
+#define DOUBAO_ACCESS_KEY "-------"  // 豆包访问密钥
 #endif
 
 // OTA更新配置
