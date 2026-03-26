@@ -1,5 +1,7 @@
 #include "realtime_voice_app.h"
 
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_random.h>
@@ -36,6 +38,32 @@ String summarizePayload(const String& payload, size_t max_len = 120) {
     return payload.substring(0, max_len) + "...";
 }
 
+constexpr char kOtaPrefsNamespace[] = "ota";
+constexpr char kOtaEsp32VersionKey[] = "esp32_ver";
+constexpr char kOtaStm32VersionKey[] = "stm32_ver";
+constexpr int kInternalMemoryPins[] = {35, 36, 37};
+
+String takeToken(String& text) {
+    text.trim();
+    if (text.length() == 0) {
+        return "";
+    }
+
+    const int space_index = text.indexOf(' ');
+    if (space_index < 0) {
+        String token = text;
+        text = "";
+        token.trim();
+        return token;
+    }
+
+    String token = text.substring(0, space_index);
+    text = text.substring(space_index + 1);
+    token.trim();
+    text.trim();
+    return token;
+}
+
 bool isRecoverableDialogError(const String& payload) {
     return payload.indexOf("AudioASRIdleTimeoutError") >= 0 ||
            payload.indexOf("ClientLackDataError") >= 0 ||
@@ -70,6 +98,8 @@ const char* stateName(AppState state) {
             return "api";
         case AppState::SessionStarting:
             return "session";
+        case AppState::Ota:
+            return "ota";
         case AppState::Listening:
             return "listening";
         case AppState::Thinking:
@@ -81,6 +111,239 @@ const char* stateName(AppState state) {
         default:
             return "unknown";
     }
+}
+
+const char* defaultOtaUrl(OtaTarget target) {
+    switch (target) {
+        case OtaTarget::Esp32Self:
+            return app::kOtaEsp32DefaultUrl;
+        case OtaTarget::Stm32:
+            return app::kOtaStm32DefaultUrl;
+        default:
+            return "";
+    }
+}
+
+const char* defaultOtaSha256(OtaTarget target) {
+    switch (target) {
+        case OtaTarget::Esp32Self:
+            return app::kOtaEsp32DefaultSha256;
+        case OtaTarget::Stm32:
+            return app::kOtaStm32DefaultSha256;
+        default:
+            return "";
+    }
+}
+
+const char* defaultOtaManifestUrl(OtaTarget target) {
+    switch (target) {
+        case OtaTarget::Esp32Self:
+            return app::kOtaEsp32ManifestUrl;
+        case OtaTarget::Stm32:
+            return app::kOtaStm32ManifestUrl;
+        default:
+            return "";
+    }
+}
+
+const char* compiledOtaVersion(OtaTarget target) {
+    switch (target) {
+        case OtaTarget::Esp32Self:
+            return app::kOtaEsp32CurrentVersion;
+        case OtaTarget::Stm32:
+            return app::kOtaStm32CurrentVersion;
+        default:
+            return "";
+    }
+}
+
+const char* otaVersionKey(OtaTarget target) {
+    switch (target) {
+        case OtaTarget::Esp32Self:
+            return kOtaEsp32VersionKey;
+        case OtaTarget::Stm32:
+            return kOtaStm32VersionKey;
+        default:
+            return "";
+    }
+}
+
+String trimCopy(String value) {
+    value.trim();
+    return value;
+}
+
+String currentOtaVersion(OtaTarget target) {
+    Preferences prefs;
+    if (prefs.begin(kOtaPrefsNamespace, false)) {
+        String stored = "";
+        if (prefs.isKey(otaVersionKey(target))) {
+            stored = trimCopy(prefs.getString(otaVersionKey(target), ""));
+        }
+        prefs.end();
+        if (stored.length() > 0) {
+            return stored;
+        }
+    }
+
+    return trimCopy(String(compiledOtaVersion(target)));
+}
+
+bool isBoardReservedPin(int pin) {
+    for (const int reserved_pin : kInternalMemoryPins) {
+        if (pin == reserved_pin) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool saveInstalledOtaVersion(OtaTarget target, const String& version) {
+    const String normalized = trimCopy(version);
+    if (normalized.length() == 0) {
+        return false;
+    }
+
+    Preferences prefs;
+    if (!prefs.begin(kOtaPrefsNamespace, false)) {
+        return false;
+    }
+
+    const bool ok = prefs.putString(otaVersionKey(target), normalized) == normalized.length();
+    prefs.end();
+    return ok;
+}
+
+String makeAbsoluteOtaUrl(const String& value) {
+    if (value.startsWith("http://") || value.startsWith("https://")) {
+        return value;
+    }
+
+    if (value.length() == 0) {
+        return "";
+    }
+
+    if (value.startsWith("/")) {
+        return String(app::kOtaServerBaseUrl) + value;
+    }
+
+    return String(app::kOtaServerBaseUrl) + "/" + value;
+}
+
+struct OtaRequestResolution {
+    String url;
+    String sha256;
+    String version;
+    String md5;
+    String update_log;
+    bool manifest_used = false;
+    bool already_latest = false;
+};
+
+bool fetchManifestResolution(
+    OtaTarget target,
+    OtaRequestResolution& resolution,
+    String& error) {
+    const char* manifest_url = defaultOtaManifestUrl(target);
+    if (manifest_url == nullptr || manifest_url[0] == '\0') {
+        error = "manifest disabled";
+        return false;
+    }
+
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, manifest_url)) {
+        error = "manifest connect failed";
+        return false;
+    }
+
+    http.setTimeout(app::kOtaHttpTimeoutMs);
+    const int http_code = http.GET();
+    if (http_code != HTTP_CODE_OK) {
+        error = String("manifest GET failed: ") + http_code;
+        http.end();
+        return false;
+    }
+
+    const String payload = http.getString();
+    http.end();
+
+    DynamicJsonDocument doc(app::kOtaManifestJsonBytes);
+    const DeserializationError json_error = deserializeJson(doc, payload);
+    if (json_error) {
+        error = String("manifest JSON parse failed: ") + json_error.c_str();
+        return false;
+    }
+
+    JsonObjectConst root = doc.as<JsonObjectConst>();
+    if (root.isNull()) {
+        error = "manifest root is not object";
+        return false;
+    }
+
+    JsonObjectConst manifest = root;
+    const char* target_key = target == OtaTarget::Esp32Self ? "esp32" : "stm32";
+    if (root[target_key].is<JsonObjectConst>()) {
+        manifest = root[target_key].as<JsonObjectConst>();
+    }
+
+    resolution.version = trimCopy(String(manifest["version"] | ""));
+    resolution.url = trimCopy(String(manifest["firmware_url"] | ""));
+    if (resolution.url.length() == 0) {
+        resolution.url = trimCopy(String(manifest["url"] | ""));
+    }
+    if (resolution.url.length() == 0) {
+        resolution.url = trimCopy(String(manifest["firmware_name"] | ""));
+    }
+    resolution.url = makeAbsoluteOtaUrl(resolution.url);
+    resolution.sha256 = trimCopy(String(manifest["sha256"] | ""));
+    if (resolution.sha256.length() == 0) {
+        resolution.sha256 = trimCopy(String(manifest["sha256sum"] | ""));
+    }
+    resolution.md5 = trimCopy(String(manifest["md5"] | ""));
+    resolution.update_log = trimCopy(String(manifest["update_log"] | ""));
+    resolution.manifest_used = true;
+
+    if (resolution.url.length() == 0) {
+        error = "manifest missing firmware_url";
+        return false;
+    }
+
+    const String current_version = currentOtaVersion(target);
+    if (current_version.length() > 0 &&
+        resolution.version.length() > 0 &&
+        resolution.version.equalsIgnoreCase(current_version)) {
+        resolution.already_latest = true;
+    }
+
+    return true;
+}
+
+bool resolveConfiguredOtaRequest(
+    OtaTarget target,
+    OtaRequestResolution& resolution,
+    String& detail) {
+    resolution = OtaRequestResolution();
+    resolution.url = String(defaultOtaUrl(target));
+    resolution.sha256 = String(defaultOtaSha256(target));
+
+    OtaRequestResolution manifest_resolution;
+    String manifest_error;
+    if (fetchManifestResolution(target, manifest_resolution, manifest_error)) {
+        resolution = manifest_resolution;
+        detail = String("manifest=") + defaultOtaManifestUrl(target);
+        return true;
+    }
+
+    if (resolution.url.length() > 0) {
+        detail = manifest_error.length() > 0
+                     ? String("manifest unavailable, fallback direct: ") + manifest_error
+                     : "direct package";
+        return true;
+    }
+
+    detail = manifest_error.length() > 0 ? manifest_error : "OTA package is not configured";
+    return false;
 }
 
 }  // namespace
@@ -95,12 +358,23 @@ RealtimeVoiceApp::RealtimeVoiceApp()
       reconnect_after_playback_(false),
       audio_uplink_enabled_(false),
       api_activation_requested_(false),
+      ota_mode_request_seen_(false),
+      ota_esp32_button_enabled_(false),
+      ota_stm32_button_enabled_(false),
+      ota_esp32_button_raw_(false),
+      ota_stm32_button_raw_(false),
+      ota_esp32_button_pressed_(false),
+      ota_stm32_button_pressed_(false),
       reconnect_at_ms_(0),
       last_audio_rx_ms_(0),
       last_tts_ended_ms_(0),
       last_monitor_ms_(0),
       listening_started_ms_(0),
-      thinking_started_ms_(0) {
+      thinking_started_ms_(0),
+      ota_mode_started_ms_(0),
+      ota_last_attempt_ms_(0),
+      ota_esp32_button_changed_ms_(0),
+      ota_stm32_button_changed_ms_(0) {
     session_config_.bot_name = app::kBotName;
     session_config_.system_role = app::kSystemRole;
     session_config_.speaking_style = app::kSpeakingStyle;
@@ -125,7 +399,14 @@ bool RealtimeVoiceApp::begin() {
         "heap=%u psram=%u",
         static_cast<unsigned>(ESP.getFreeHeap()),
         static_cast<unsigned>(ESP.getFreePsram()));
-    LOGI("APP", "build=%s %s", __DATE__, __TIME__);
+    const String installed_esp32_version = currentOtaVersion(OtaTarget::Esp32Self);
+    const String installed_stm32_version = currentOtaVersion(OtaTarget::Stm32);
+    LOGI("APP", "firmware=%s build=%s %s", installed_esp32_version.c_str(), __DATE__, __TIME__);
+    LOGI(
+        "APP",
+        "versions esp32=%s stm32=%s",
+        installed_esp32_version.c_str(),
+        installed_stm32_version.c_str());
 
     led_.begin();
     setState(AppState::Booting);
@@ -134,11 +415,13 @@ bool RealtimeVoiceApp::begin() {
         LOGE("APP", "Aux serial init failed");
         return false;
     }
+    beginOtaButtons();
 
     if (!audio_.begin()) {
         LOGE("APP", "Audio pipeline init failed");
         return false;
     }
+    ota_.begin(aux_serial_);
     loadSpeakerVolumePreference();
     printSerialHelp();
 
@@ -163,6 +446,16 @@ bool RealtimeVoiceApp::begin() {
 }
 
 void RealtimeVoiceApp::loop() {
+    serviceOtaButtons();
+
+    if (state_ == AppState::Ota) {
+        led_.update();
+        serviceSerialCommands();
+        serviceOtaMode();
+        delay(1);
+        return;
+    }
+
     ws_client_.loop();
     led_.update();
 
@@ -252,6 +545,110 @@ bool RealtimeVoiceApp::beginAuxSerial() {
         app::kAuxSerialRxPin,
         app::kAuxSerialTxPin);
     return true;
+}
+
+void RealtimeVoiceApp::beginOtaButtons() {
+    const int reserved_pins[] = {
+        app::kMicWsPin,
+        app::kMicSdPin,
+        app::kMicSckPin,
+        app::kSpkDinPin,
+        app::kSpkBclkPin,
+        app::kSpkLrcPin,
+        app::kSpkAmpEnablePin,
+        app::kRgbLedPin,
+        app::kAuxSerialRxPin,
+        app::kAuxSerialTxPin,
+        app::kStm32Boot0Pin,
+        app::kStm32Boot1Pin,
+        app::kStm32ResetPin,
+    };
+
+    auto configure_button = [&](int pin, const char* name, bool& enabled) {
+        enabled = false;
+        if (pin < 0) {
+            LOGW("OTA", "%s button disabled, pin not configured", name);
+            return;
+        }
+
+        if (isBoardReservedPin(pin)) {
+            LOGE(
+                "OTA",
+                "%s button pin %d is reserved by internal flash/PSRAM on ESP32-S3 N16R8; choose another GPIO",
+                name,
+                pin);
+            return;
+        }
+
+        for (const int reserved_pin : reserved_pins) {
+            if (pin >= 0 && pin == reserved_pin) {
+                LOGE("OTA", "%s button pin %d conflicts with active hardware", name, pin);
+                return;
+            }
+        }
+
+        pinMode(
+            pin,
+            app::kOtaButtonActiveLevel == LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
+        enabled = true;
+        LOGI("OTA", "%s button ready on GPIO%d", name, pin);
+    };
+
+    if (app::kOtaEsp32ButtonPin == app::kOtaStm32ButtonPin &&
+        app::kOtaEsp32ButtonPin >= 0) {
+        LOGE(
+            "OTA",
+            "OTA button pins conflict: esp32=%d stm32=%d",
+            app::kOtaEsp32ButtonPin,
+            app::kOtaStm32ButtonPin);
+    } else {
+        configure_button(app::kOtaEsp32ButtonPin, "ESP32 OTA", ota_esp32_button_enabled_);
+        configure_button(app::kOtaStm32ButtonPin, "STM32 OTA", ota_stm32_button_enabled_);
+    }
+
+    ota_esp32_button_raw_ =
+        ota_esp32_button_enabled_ && readOtaButton(app::kOtaEsp32ButtonPin);
+    ota_stm32_button_raw_ =
+        ota_stm32_button_enabled_ && readOtaButton(app::kOtaStm32ButtonPin);
+    ota_esp32_button_pressed_ = ota_esp32_button_raw_;
+    ota_stm32_button_pressed_ = ota_stm32_button_raw_;
+    ota_esp32_button_changed_ms_ = millis();
+    ota_stm32_button_changed_ms_ = millis();
+}
+
+bool RealtimeVoiceApp::readOtaButton(int pin) const {
+    if (pin < 0) {
+        return false;
+    }
+    return digitalRead(pin) == app::kOtaButtonActiveLevel;
+}
+
+bool RealtimeVoiceApp::detectButtonPress(
+    int pin,
+    bool enabled,
+    bool& last_raw,
+    bool& stable_pressed,
+    uint32_t& last_change_ms) {
+    if (!enabled) {
+        return false;
+    }
+
+    const bool raw_pressed = readOtaButton(pin);
+    if (raw_pressed != last_raw) {
+        last_raw = raw_pressed;
+        last_change_ms = millis();
+    }
+
+    if ((millis() - last_change_ms) < app::kOtaButtonDebounceMs) {
+        return false;
+    }
+
+    if (raw_pressed == stable_pressed) {
+        return false;
+    }
+
+    stable_pressed = raw_pressed;
+    return stable_pressed;
 }
 
 bool RealtimeVoiceApp::connectDoubao() {
@@ -376,7 +773,7 @@ void RealtimeVoiceApp::serviceSerialCommands() {
             }
             continue;
         }
-        if (serial_command_buffer_.length() < 64) {
+        if (serial_command_buffer_.length() < app::kSerialCommandMaxLength) {
             serial_command_buffer_ += static_cast<char>(ch);
         }
     }
@@ -411,6 +808,11 @@ void RealtimeVoiceApp::handleSerialCommand(const String& command) {
 
     if (normalized == "help" || normalized == "?") {
         printSerialHelp();
+        return;
+    }
+
+    if (normalized == "ota" || normalized.startsWith("ota ")) {
+        handleOtaCommand(command);
         return;
     }
 
@@ -463,6 +865,128 @@ void RealtimeVoiceApp::handleSerialCommand(const String& command) {
 
     LOGW("APP", "Unknown serial command: %s", command.c_str());
     printSerialHelp();
+}
+
+void RealtimeVoiceApp::serviceOtaButtons() {
+    if (detectButtonPress(
+            app::kOtaEsp32ButtonPin,
+            ota_esp32_button_enabled_,
+            ota_esp32_button_raw_,
+            ota_esp32_button_pressed_,
+            ota_esp32_button_changed_ms_)) {
+        enterOtaMode(OtaTarget::Esp32Self, "esp32 ota button");
+    }
+
+    if (detectButtonPress(
+            app::kOtaStm32ButtonPin,
+            ota_stm32_button_enabled_,
+            ota_stm32_button_raw_,
+            ota_stm32_button_pressed_,
+            ota_stm32_button_changed_ms_)) {
+        enterOtaMode(OtaTarget::Stm32, "stm32 ota button");
+    }
+}
+
+void RealtimeVoiceApp::serviceOtaMode() {
+    if (state_ != AppState::Ota || ota_mode_request_seen_) {
+        return;
+    }
+
+    const uint32_t now = millis();
+    if ((now - ota_mode_started_ms_) >= app::kOtaRequestWindowMs) {
+        exitOtaMode("OTA request timeout");
+        return;
+    }
+
+    if ((now - ota_last_attempt_ms_) < app::kOtaAutoRetryIntervalMs) {
+        return;
+    }
+
+    ota_last_attempt_ms_ = now;
+    const OtaTarget target = ota_.selectedTarget();
+    OtaRequestResolution resolution;
+    String detail;
+    if (!resolveConfiguredOtaRequest(target, resolution, detail)) {
+        LOGW("OTA", "Auto resolve failed: %s", detail.c_str());
+        return;
+    }
+
+    if (resolution.manifest_used) {
+        const String installed_version = currentOtaVersion(target);
+        LOGI(
+            "OTA",
+            "Manifest target=%s current=%s latest=%s",
+            ota_.selectedTargetName(),
+            installed_version.c_str(),
+            resolution.version.length() > 0 ? resolution.version.c_str() : "(unknown)");
+        if (resolution.update_log.length() > 0) {
+            LOGI("OTA", "Update log: %s", resolution.update_log.c_str());
+        }
+    } else if (detail.length() > 0) {
+        LOGI("OTA", "%s", detail.c_str());
+    }
+
+    if (resolution.already_latest) {
+        const String installed_version = currentOtaVersion(target);
+        LOGI(
+            "OTA",
+            "Target=%s already at latest version=%s",
+            ota_.selectedTargetName(),
+            installed_version.c_str());
+        exitOtaMode("OTA already current");
+        return;
+    }
+
+    LOGI("OTA", "Auto pull target=%s url=%s", ota_.selectedTargetName(), resolution.url.c_str());
+    if (runOtaUpdate(target, resolution.url, resolution.sha256, resolution.version)) {
+        ota_mode_request_seen_ = true;
+        exitOtaMode("OTA finished");
+        return;
+    }
+
+    setState(AppState::Ota);
+    LOGW("OTA", "Auto pull failed: %s", ota_.lastError().c_str());
+}
+
+void RealtimeVoiceApp::sendStm32StopCommand() {
+    const uint8_t stop_byte = app::kStm32StopCommandByte;
+    aux_serial_.write(&stop_byte, 1);
+    aux_serial_.flush();
+    LOGI("OTA", "Sent STM32 stop command 0x%02X", static_cast<unsigned>(stop_byte));
+}
+
+bool RealtimeVoiceApp::enterOtaMode(OtaTarget target, const char* reason) {
+    if (state_ != AppState::Ota) {
+        if (!prepareForOta(reason)) {
+            return false;
+        }
+        if (target != OtaTarget::Stm32) {
+            sendStm32StopCommand();
+        }
+    }
+
+    ota_.setSelectedTarget(target);
+    ota_mode_request_seen_ = false;
+    ota_mode_started_ms_ = millis();
+    ota_last_attempt_ms_ = ota_mode_started_ms_ - app::kOtaAutoRetryIntervalMs;
+    setState(AppState::Ota);
+
+    LOGI(
+        "OTA",
+        "Mode=%s armed for %u ms, source=%s",
+        ota_.selectedTargetName(),
+        static_cast<unsigned>(app::kOtaRequestWindowMs),
+        defaultOtaManifestUrl(target)[0] != '\0' ? defaultOtaManifestUrl(target) : defaultOtaUrl(target));
+    if (WiFi.status() == WL_CONNECTED) {
+        LOGI("OTA", "WiFi ip=%s", WiFi.localIP().toString().c_str());
+    }
+    return true;
+}
+
+void RealtimeVoiceApp::exitOtaMode(const char* reason) {
+    LOGI("OTA", "Exiting OTA mode: %s", reason != nullptr ? reason : "done");
+    delay(100);
+    ESP.restart();
 }
 
 void RealtimeVoiceApp::requestApiActivation() {
@@ -523,9 +1047,11 @@ void RealtimeVoiceApp::deactivateApiConnection(const char* reason) {
 void RealtimeVoiceApp::loadSpeakerVolumePreference() {
     Preferences prefs;
     uint8_t stored_volume = app::kSpeakerVolumeDefaultPercent;
-    if (prefs.begin(app::kVolumePrefsNamespace, true)) {
-        stored_volume =
-            prefs.getUChar(app::kVolumePrefsKey, app::kSpeakerVolumeDefaultPercent);
+    if (prefs.begin(app::kVolumePrefsNamespace, false)) {
+        if (prefs.isKey(app::kVolumePrefsKey)) {
+            stored_volume =
+                prefs.getUChar(app::kVolumePrefsKey, app::kSpeakerVolumeDefaultPercent);
+        }
         prefs.end();
     } else {
         LOGW("APP", "Volume preferences open failed, using default");
@@ -571,7 +1097,363 @@ void RealtimeVoiceApp::applySpeakerVolume(int volume_percent, bool persist, cons
 void RealtimeVoiceApp::printSerialHelp() {
     LOGI(
         "APP",
-        "Serial cmds: `vol`, `vol 80`, `vol +`, `vol -`, `mute`, `help`");
+        "Serial cmds: `vol`, `vol 80`, `vol +`, `vol -`, `mute`, `ota ...`, `help`");
+    LOGI(
+        "APP",
+        "OTA trigger: press ESP32/STM32 OTA button -> auto read manifest/direct package within 5s");
+}
+
+void RealtimeVoiceApp::printOtaHelp() {
+    LOGI(
+        "OTA",
+        "OTA flow: press ESP32/STM32 OTA button -> auto read manifest, compare version, then update");
+    LOGI(
+        "OTA",
+        "OTA cmds: `ota status`, `ota start [url] [sha256] [version]`, `ota target esp|stm`, `ota exit`");
+    LOGI(
+        "OTA",
+        "Server=%s esp32_manifest=%s stm32_manifest=%s",
+        app::kOtaServerBaseUrl,
+        app::kOtaEsp32ManifestUrl,
+        app::kOtaStm32ManifestUrl[0] == '\0' ? "(disabled)" : app::kOtaStm32ManifestUrl);
+    LOGI(
+        "OTA",
+        "Current versions: esp32=%s stm32=%s",
+        currentOtaVersion(OtaTarget::Esp32Self).c_str(),
+        currentOtaVersion(OtaTarget::Stm32).c_str());
+    LOGI(
+        "OTA",
+        "Fallback urls: esp32=%s stm32=%s",
+        app::kOtaEsp32DefaultUrl,
+        app::kOtaStm32DefaultUrl);
+    LOGI(
+        "OTA",
+        "Buttons esp32=%d stm32=%d active_level=%d auto_stm32=%s BOOT0=%d NRST=%d BOOT1=%d",
+        app::kOtaEsp32ButtonPin,
+        app::kOtaStm32ButtonPin,
+        app::kOtaButtonActiveLevel,
+        ota_.canAutoEnterStm32Bootloader() ? "yes" : "no",
+        app::kStm32Boot0Pin,
+        app::kStm32ResetPin,
+        app::kStm32Boot1Pin);
+    LOGI("OTA", "ESP32-S3 N16R8 reserved GPIOs for internal memory: 35, 36, 37");
+}
+
+bool RealtimeVoiceApp::prepareForOta(const char* reason) {
+    LOGI("OTA", "Preparing maintenance mode: %s", reason != nullptr ? reason : "manual");
+    deactivateApiConnection("OTA requested");
+    setState(AppState::Ota);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        return true;
+    }
+
+    if (!connectWiFi()) {
+        setState(AppState::Error);
+        LOGE("OTA", "WiFi reconnect failed");
+        return false;
+    }
+
+    setState(AppState::Ota);
+    return true;
+}
+
+bool RealtimeVoiceApp::runOtaUpdate(
+    OtaTarget target,
+    const String& url,
+    const String& expected_sha256,
+    const String& resolved_version) {
+    const bool keep_ota_mode = (state_ == AppState::Ota);
+    if (url.length() == 0) {
+        LOGE("OTA", "OTA URL is empty");
+        return false;
+    }
+
+    if (state_ != AppState::Ota) {
+        if (!prepareForOta(target == OtaTarget::Esp32Self ? "esp32 update" : "stm32 update")) {
+            return false;
+        }
+    } else if (WiFi.status() != WL_CONNECTED) {
+        if (!connectWiFi()) {
+            setState(AppState::Error);
+            LOGE("OTA", "WiFi reconnect failed before OTA");
+            return false;
+        }
+        setState(AppState::Ota);
+    }
+
+    ota_.setSelectedTarget(target);
+    const bool ok = ota_.runSelectedUpdate(url, expected_sha256);
+
+    if (ok && resolved_version.length() > 0) {
+        if (saveInstalledOtaVersion(target, resolved_version)) {
+            LOGI("OTA", "Recorded %s installed version=%s", ota_.selectedTargetName(), resolved_version.c_str());
+        } else {
+            LOGW("OTA", "Failed to persist %s installed version=%s", ota_.selectedTargetName(), resolved_version.c_str());
+        }
+    }
+
+    if (target == OtaTarget::Esp32Self) {
+        if (!ok) {
+            setState(
+                keep_ota_mode ? AppState::Ota
+                              : (WiFi.status() == WL_CONNECTED ? AppState::Standby : AppState::Error));
+        }
+        return ok;
+    }
+
+    if (ok) {
+        setState(
+            keep_ota_mode ? AppState::Ota
+                          : (WiFi.status() == WL_CONNECTED ? AppState::Standby : AppState::Error));
+        LOGI("OTA", "STM32 OTA finished");
+        return true;
+    }
+
+    setState(
+        keep_ota_mode ? AppState::Ota
+                      : (WiFi.status() == WL_CONNECTED ? AppState::Standby : AppState::Error));
+    LOGE("OTA", "STM32 OTA failed: %s", ota_.lastError().c_str());
+    return false;
+}
+
+void RealtimeVoiceApp::handleOtaCommand(const String& command) {
+    String payload = command;
+    payload.trim();
+    if (payload.length() >= 3) {
+        payload = payload.substring(3);
+    } else {
+        payload = "";
+    }
+    payload.trim();
+
+    if (payload.length() == 0 || payload.equalsIgnoreCase("help")) {
+        printOtaHelp();
+        return;
+    }
+
+    String action = takeToken(payload);
+    String action_lower = action;
+    action_lower.toLowerCase();
+
+    if (action_lower == "status") {
+        const uint32_t elapsed_ms = millis() - ota_mode_started_ms_;
+        const uint32_t remaining_ms =
+            elapsed_ms >= app::kOtaRequestWindowMs ? 0 : (app::kOtaRequestWindowMs - elapsed_ms);
+        LOGI(
+            "OTA",
+            "state=%s target=%s wifi=%s request_seen=%s remaining_ms=%u",
+            state_ == AppState::Ota ? "armed" : "idle",
+            ota_.selectedTargetName(),
+            WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
+            ota_mode_request_seen_ ? "yes" : "no",
+            static_cast<unsigned>(remaining_ms));
+        LOGI(
+            "OTA",
+            "versions esp32=%s stm32=%s manifests esp32=%s stm32=%s",
+            currentOtaVersion(OtaTarget::Esp32Self).c_str(),
+            currentOtaVersion(OtaTarget::Stm32).c_str(),
+            app::kOtaEsp32ManifestUrl,
+            app::kOtaStm32ManifestUrl[0] == '\0' ? "(disabled)" : app::kOtaStm32ManifestUrl);
+        return;
+    }
+
+    if (action_lower == "exit") {
+        if (state_ != AppState::Ota) {
+            LOGW("OTA", "OTA mode is not active");
+            return;
+        }
+        exitOtaMode("serial exit");
+        return;
+    }
+
+    if (action_lower == "target") {
+        if (state_ != AppState::Ota) {
+            LOGW("OTA", "Press the OTA button first");
+            return;
+        }
+        String target = takeToken(payload);
+        target.toLowerCase();
+        if (target == "esp" || target == "esp32") {
+            ota_.setSelectedTarget(OtaTarget::Esp32Self);
+            ota_mode_started_ms_ = millis();
+            ota_last_attempt_ms_ = ota_mode_started_ms_ - app::kOtaAutoRetryIntervalMs;
+            LOGI("OTA", "Selected OTA target=esp32");
+            return;
+        }
+        if (target == "stm" || target == "stm32") {
+            ota_.setSelectedTarget(OtaTarget::Stm32);
+            ota_mode_started_ms_ = millis();
+            ota_last_attempt_ms_ = ota_mode_started_ms_ - app::kOtaAutoRetryIntervalMs;
+            LOGI("OTA", "Selected OTA target=stm32");
+            return;
+        }
+        LOGW("OTA", "Unknown OTA target: %s", target.c_str());
+        printOtaHelp();
+        return;
+    }
+
+    if (action_lower == "start") {
+        if (state_ != AppState::Ota) {
+            LOGW("OTA", "Press the OTA button first");
+            return;
+        }
+        String url = takeToken(payload);
+        String sha256 = takeToken(payload);
+        if (url.length() == 0) {
+            OtaRequestResolution resolution;
+            String detail;
+            if (!resolveConfiguredOtaRequest(ota_.selectedTarget(), resolution, detail)) {
+                LOGW("OTA", "Manual resolve failed: %s", detail.c_str());
+                return;
+            }
+            if (resolution.manifest_used) {
+                const String installed_version = currentOtaVersion(ota_.selectedTarget());
+                LOGI(
+                    "OTA",
+                    "Manual manifest latest=%s current=%s",
+                    resolution.version.c_str(),
+                    installed_version.c_str());
+            } else if (detail.length() > 0) {
+                LOGI("OTA", "%s", detail.c_str());
+            }
+            if (resolution.already_latest) {
+                exitOtaMode("OTA already current");
+                return;
+            }
+            url = resolution.url;
+            if (sha256.length() == 0) {
+                sha256 = resolution.sha256;
+            }
+            if (payload.length() == 0) {
+                payload = resolution.version;
+            }
+        }
+        if (sha256.length() == 0) {
+            sha256 = defaultOtaSha256(ota_.selectedTarget());
+        }
+        ota_mode_request_seen_ = true;
+        const String resolved_version = trimCopy(payload);
+        if (runOtaUpdate(ota_.selectedTarget(), url, sha256, resolved_version)) {
+            exitOtaMode("OTA finished");
+            return;
+        }
+        ota_mode_request_seen_ = false;
+        ota_mode_started_ms_ = millis();
+        ota_last_attempt_ms_ = ota_mode_started_ms_ - app::kOtaAutoRetryIntervalMs;
+        setState(AppState::Ota);
+        LOGW("OTA", "Manual OTA failed: %s", ota_.lastError().c_str());
+        return;
+    }
+
+    if (action_lower == "esp" || action_lower == "esp32") {
+        if (state_ != AppState::Ota) {
+            LOGW("OTA", "Press the ESP32 OTA button first");
+            return;
+        }
+        String url = takeToken(payload);
+        String sha256 = takeToken(payload);
+        if (url.length() == 0) {
+            OtaRequestResolution resolution;
+            String detail;
+            if (!resolveConfiguredOtaRequest(OtaTarget::Esp32Self, resolution, detail)) {
+                LOGW("OTA", "Manual ESP32 resolve failed: %s", detail.c_str());
+                return;
+            }
+            if (resolution.manifest_used) {
+                const String installed_version = currentOtaVersion(OtaTarget::Esp32Self);
+                LOGI(
+                    "OTA",
+                    "ESP32 manifest latest=%s current=%s",
+                    resolution.version.c_str(),
+                    installed_version.c_str());
+            } else if (detail.length() > 0) {
+                LOGI("OTA", "%s", detail.c_str());
+            }
+            if (resolution.already_latest) {
+                exitOtaMode("OTA already current");
+                return;
+            }
+            url = resolution.url;
+            if (sha256.length() == 0) {
+                sha256 = resolution.sha256;
+            }
+            if (payload.length() == 0) {
+                payload = resolution.version;
+            }
+        }
+        if (sha256.length() == 0) {
+            sha256 = defaultOtaSha256(OtaTarget::Esp32Self);
+        }
+        ota_mode_request_seen_ = true;
+        const String resolved_version = trimCopy(payload);
+        if (runOtaUpdate(OtaTarget::Esp32Self, url, sha256, resolved_version)) {
+            exitOtaMode("OTA finished");
+            return;
+        }
+        ota_mode_request_seen_ = false;
+        ota_mode_started_ms_ = millis();
+        ota_last_attempt_ms_ = ota_mode_started_ms_ - app::kOtaAutoRetryIntervalMs;
+        setState(AppState::Ota);
+        LOGW("OTA", "Manual ESP32 OTA failed: %s", ota_.lastError().c_str());
+        return;
+    }
+
+    if (action_lower == "stm" || action_lower == "stm32") {
+        if (state_ != AppState::Ota) {
+            LOGW("OTA", "Press the STM32 OTA button first");
+            return;
+        }
+        String url = takeToken(payload);
+        String sha256 = takeToken(payload);
+        if (url.length() == 0) {
+            OtaRequestResolution resolution;
+            String detail;
+            if (!resolveConfiguredOtaRequest(OtaTarget::Stm32, resolution, detail)) {
+                LOGW("OTA", "Manual STM32 resolve failed: %s", detail.c_str());
+                return;
+            }
+            if (resolution.manifest_used) {
+                const String installed_version = currentOtaVersion(OtaTarget::Stm32);
+                LOGI(
+                    "OTA",
+                    "STM32 manifest latest=%s current=%s",
+                    resolution.version.c_str(),
+                    installed_version.c_str());
+            } else if (detail.length() > 0) {
+                LOGI("OTA", "%s", detail.c_str());
+            }
+            if (resolution.already_latest) {
+                exitOtaMode("OTA already current");
+                return;
+            }
+            url = resolution.url;
+            if (sha256.length() == 0) {
+                sha256 = resolution.sha256;
+            }
+            if (payload.length() == 0) {
+                payload = resolution.version;
+            }
+        }
+        if (sha256.length() == 0) {
+            sha256 = defaultOtaSha256(OtaTarget::Stm32);
+        }
+        ota_mode_request_seen_ = true;
+        const String resolved_version = trimCopy(payload);
+        if (runOtaUpdate(OtaTarget::Stm32, url, sha256, resolved_version)) {
+            exitOtaMode("OTA finished");
+            return;
+        }
+        ota_mode_request_seen_ = false;
+        ota_mode_started_ms_ = millis();
+        ota_last_attempt_ms_ = ota_mode_started_ms_ - app::kOtaAutoRetryIntervalMs;
+        setState(AppState::Ota);
+        LOGW("OTA", "Manual STM32 OTA failed: %s", ota_.lastError().c_str());
+        return;
+    }
+
+    LOGW("OTA", "Unknown OTA command: %s", command.c_str());
+    printOtaHelp();
 }
 
 void RealtimeVoiceApp::setState(AppState state) {
@@ -590,6 +1472,9 @@ void RealtimeVoiceApp::setState(AppState state) {
         case AppState::ApiConnecting:
         case AppState::SessionStarting:
             led_.setState(LedState::ApiConnecting);
+            break;
+        case AppState::Ota:
+            led_.setState(LedState::Ota);
             break;
         case AppState::Listening:
             led_.setState(LedState::Listening);

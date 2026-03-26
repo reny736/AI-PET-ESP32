@@ -8,6 +8,7 @@ enum class LedState {
     WifiConnecting,
     Standby,
     ApiConnecting,
+    Ota,
     Listening,
     Thinking,
     Speaking,

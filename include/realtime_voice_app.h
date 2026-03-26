@@ -6,6 +6,7 @@
 #include "audio_pipeline.h"
 #include "doubao_protocol.h"
 #include "doubao_ws_client.h"
+#include "ota_manager.h"
 #include "status_led.h"
 
 enum class AppState {
@@ -14,6 +15,7 @@ enum class AppState {
     Standby,
     ApiConnecting,
     SessionStarting,
+    Ota,
     Listening,
     Thinking,
     Speaking,
@@ -31,6 +33,7 @@ private:
     bool connectWiFi();
     bool connectDoubao();
     bool beginAuxSerial();
+    void beginOtaButtons();
     bool sendStartConnection();
     bool sendStartSession();
     bool sendSayHello();
@@ -38,6 +41,8 @@ private:
     void stopListeningForThinking();
     void serviceSerialCommands();
     void serviceAuxSerial();
+    void serviceOtaButtons();
+    void serviceOtaMode();
     void handleSerialCommand(const String& command);
     void requestApiActivation();
     void deactivateApiConnection(const char* reason);
@@ -45,6 +50,24 @@ private:
     void saveSpeakerVolumePreference(uint8_t volume_percent);
     void applySpeakerVolume(int volume_percent, bool persist, const char* source);
     void printSerialHelp();
+    void printOtaHelp();
+    void handleOtaCommand(const String& command);
+    bool enterOtaMode(OtaTarget target, const char* reason);
+    void exitOtaMode(const char* reason);
+    bool prepareForOta(const char* reason);
+    bool runOtaUpdate(
+        OtaTarget target,
+        const String& url,
+        const String& expected_sha256,
+        const String& resolved_version = "");
+    bool readOtaButton(int pin) const;
+    bool detectButtonPress(
+        int pin,
+        bool enabled,
+        bool& last_raw,
+        bool& stable_pressed,
+        uint32_t& last_change_ms);
+    void sendStm32StopCommand();
     void setState(AppState state);
     void scheduleReconnect(const char* reason, bool allow_playback_drain = false);
     void reconnectIfNeeded();
@@ -61,6 +84,7 @@ private:
     StatusLed led_;
     AudioPipeline audio_;
     DoubaoWsClient ws_client_;
+    OtaManager ota_;
     HardwareSerial aux_serial_;
     doubao::SessionConfig session_config_;
 
@@ -73,6 +97,13 @@ private:
     bool reconnect_after_playback_;
     bool audio_uplink_enabled_;
     bool api_activation_requested_;
+    bool ota_mode_request_seen_;
+    bool ota_esp32_button_enabled_;
+    bool ota_stm32_button_enabled_;
+    bool ota_esp32_button_raw_;
+    bool ota_stm32_button_raw_;
+    bool ota_esp32_button_pressed_;
+    bool ota_stm32_button_pressed_;
     String deferred_reconnect_reason_;
 
     uint32_t reconnect_at_ms_;
@@ -81,5 +112,9 @@ private:
     uint32_t last_monitor_ms_;
     uint32_t listening_started_ms_;
     uint32_t thinking_started_ms_;
+    uint32_t ota_mode_started_ms_;
+    uint32_t ota_last_attempt_ms_;
+    uint32_t ota_esp32_button_changed_ms_;
+    uint32_t ota_stm32_button_changed_ms_;
     String serial_command_buffer_;
 };

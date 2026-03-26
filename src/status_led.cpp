@@ -30,6 +30,9 @@ void StatusLed::setState(LedState state) {
         case LedState::Speaking:
             showColor(255, 0, 120);
             break;
+        case LedState::Ota:
+            showColor(0, 0, 255);
+            break;
         case LedState::Error:
             showColor(255, 0, 0);
             break;
@@ -82,6 +85,9 @@ void StatusLed::update() {
             showColor(0, v, v / 4);
             break;
         }
+        case LedState::Ota:
+            showColor(0, 0, 255);
+            break;
         case LedState::Listening: {
             const uint8_t v = pulse(phase_);
             showColor(0, v, v / 2);
