@@ -13,6 +13,12 @@
 #include "app_config.h"
 #include "logger.h"
 
+/**
+ * @file ota_manager.cpp
+ * @brief OTA更新管理器实现
+ * @details 负责处理ESP32和STM32设备的OTA更新，包括固件下载、验证和刷新等功能
+ */
+
 namespace {
 
 constexpr char kStagingPath[] = "/stm32_ota.bin";
@@ -29,10 +35,20 @@ constexpr uint8_t kStm32WriteMemoryCommand = 0x31;
 constexpr uint8_t kStm32EraseMemoryCommand = 0x43;
 constexpr uint8_t kStm32ExtendedEraseCommand = 0x44;
 
+/**
+ * @brief 将值向上对齐到4字节边界
+ * @param value 需要对齐的值
+ * @return 对齐后的值
+ */
 size_t align4(size_t value) {
     return (value + 3U) & ~static_cast<size_t>(3U);
 }
 
+/**
+ * @brief 将字符串转换为小写并去除首尾空白
+ * @param input 输入字符串
+ * @return 处理后的字符串
+ */
 String toLowerTrimmed(const String& input) {
     String normalized = input;
     normalized.trim();
@@ -40,12 +56,24 @@ String toLowerTrimmed(const String& input) {
     return normalized;
 }
 
+/**
+ * @brief 检查字符是否为十六进制字符
+ * @param ch 要检查的字符
+ * @return 是十六进制字符返回true，否则返回false
+ */
 bool isHexChar(char ch) {
     return (ch >= '0' && ch <= '9') ||
            (ch >= 'a' && ch <= 'f') ||
            (ch >= 'A' && ch <= 'F');
 }
 
+/**
+ * @brief 规范化SHA256校验和字符串
+ * @param input 输入的SHA256字符串
+ * @param normalized 输出的规范化SHA256字符串
+ * @param error 错误信息
+ * @return 规范化成功返回true，失败返回false
+ */
 bool normalizeSha256(const String& input, String& normalized, String& error) {
     normalized = toLowerTrimmed(input);
     if (normalized.length() == 0) {
@@ -64,6 +92,11 @@ bool normalizeSha256(const String& input, String& normalized, String& error) {
     return true;
 }
 
+/**
+ * @brief 将SHA256摘要转换为十六进制字符串
+ * @param digest SHA256摘要（32字节）
+ * @return 十六进制字符串表示
+ */
 String sha256Hex(const uint8_t digest[32]) {
     static constexpr char kHex[] = "0123456789abcdef";
     char output[65] = {0};
@@ -74,6 +107,11 @@ String sha256Hex(const uint8_t digest[32]) {
     return String(output);
 }
 
+/**
+ * @class Sha256Accumulator
+ * @brief SHA256累加器类
+ * @details 用于在数据流处理过程中逐步计算SHA256校验和
+ */
 class Sha256Accumulator {
 public:
     Sha256Accumulator() : finished_(false) {
@@ -85,6 +123,11 @@ public:
         mbedtls_sha256_free(&ctx_);
     }
 
+    /**
+     * @brief 更新SHA256计算
+     * @param data 数据指针
+     * @param len 数据长度
+     */
     void update(const uint8_t* data, size_t len) {
         if (finished_ || data == nullptr || len == 0) {
             return;
@@ -92,6 +135,10 @@ public:
         mbedtls_sha256_update_ret(&ctx_, data, len);
     }
 
+    /**
+     * @brief 完成SHA256计算并返回十六进制字符串
+     * @return SHA256校验和的十六进制字符串
+     */
     String finishHex() {
         if (!finished_) {
             mbedtls_sha256_finish_ret(&ctx_, digest_);
@@ -106,6 +153,11 @@ private:
     bool finished_;
 };
 
+/**
+ * @class HttpDownloadSession
+ * @brief HTTP下载会话类
+ * @details 封装HTTP下载功能，支持HTTP和HTTPS协议
+ */
 class HttpDownloadSession {
 public:
     HttpDownloadSession() : content_length_(-1), active_(false) {
@@ -115,6 +167,12 @@ public:
         close();
     }
 
+    /**
+     * @brief 打开HTTP下载会话
+     * @param url 下载URL
+     * @param error 错误信息
+     * @return 打开成功返回true，失败返回false
+     */
     bool open(const String& url, String& error) {
         close();
 
@@ -148,6 +206,9 @@ public:
         return true;
     }
 
+    /**
+     * @brief 关闭HTTP下载会话
+     */
     void close() {
         if (active_) {
             http_.end();
@@ -156,10 +217,18 @@ public:
         content_length_ = -1;
     }
 
+    /**
+     * @brief 获取内容长度
+     * @return 内容长度（字节）
+     */
     int contentLength() const {
         return content_length_;
     }
 
+    /**
+     * @brief 获取数据流
+     * @return 数据流引用
+     */
     Stream& stream() {
         return *http_.getStreamPtr();
     }
@@ -172,8 +241,17 @@ private:
     bool active_;
 };
 
+/**
+ * @class Stm32Bootloader
+ * @brief STM32 Bootloader通信类
+ * @details 封装STM32 bootloader协议，包括同步、擦除、写入、读取和验证等操作
+ */
 class Stm32Bootloader {
 public:
+    /**
+     * @brief 构造函数
+     * @param serial 硬件串口引用
+     */
     explicit Stm32Bootloader(HardwareSerial& serial)
         : serial_(serial),
           bootloader_request_acknowledged_(false),
@@ -182,14 +260,36 @@ public:
         memset(supported_commands_, 0, sizeof(supported_commands_));
     }
 
+    /**
+     * @brief 获取最后一次错误信息
+     * @return 错误信息字符串引用
+     */
     const String& lastError() const { return last_error_; }
+    
+    /**
+     * @brief 获取协议版本
+     * @return 协议版本号
+     */
     uint8_t protocolVersion() const { return protocol_version_; }
+    
+    /**
+     * @brief 获取设备ID
+     * @return 设备ID
+     */
     uint16_t deviceId() const { return device_id_; }
 
+    /**
+     * @brief 检查是否可以自动进入bootloader模式
+     * @return 可以返回true，否则返回false
+     */
     bool canAutoEnterBootloader() const {
         return app::kStm32Boot0Pin >= 0 && app::kStm32ResetPin >= 0;
     }
 
+    /**
+     * @brief 启动bootloader会话
+     * @return 成功返回true，失败返回false
+     */
     bool startSession() {
         clearError();
         serial_.flush();
@@ -229,6 +329,11 @@ public:
         return true;
     }
 
+    /**
+     * @brief 恢复应用串口配置
+     * @param reset_target 是否复位目标设备
+     * @param keep_bootloader_mode 是否保持bootloader模式
+     */
     void restoreAppUart(bool reset_target, bool keep_bootloader_mode = false) {
         if (canAutoEnterBootloader()) {
             configureBootPinsForApp(keep_bootloader_mode);
@@ -249,10 +354,18 @@ public:
         clearInput();
     }
 
+    /**
+     * @brief 跳转到应用程序
+     * @return 成功返回true，失败返回false
+     */
     bool jumpToApp() {
         return sendGo(app::kStm32FlashBaseAddress);
     }
 
+    /**
+     * @brief 擦除Flash存储
+     * @return 成功返回true，失败返回false
+     */
     bool eraseFlash() {
         if (supports(kStm32ExtendedEraseCommand)) {
             if (!sendCommand(kStm32ExtendedEraseCommand, app::kStm32CommandTimeoutMs, "extended erase")) {
@@ -275,6 +388,13 @@ public:
         return waitForAck(app::kStm32EraseTimeoutMs, "erase");
     }
 
+    /**
+     * @brief 写入数据块到Flash
+     * @param address 目标地址
+     * @param data 数据指针
+     * @param len 数据长度
+     * @return 成功返回true，失败返回false
+     */
     bool writeChunk(uint32_t address, const uint8_t* data, size_t len) {
         if (data == nullptr || len == 0 || len > 256) {
             setError("STM32 write chunk length invalid");
@@ -307,6 +427,13 @@ public:
         return waitForAck(app::kStm32WriteTimeoutMs, "write payload");
     }
 
+    /**
+     * @brief 从Flash读取数据块
+     * @param address 源地址
+     * @param data 数据缓冲区
+     * @param len 读取长度
+     * @return 成功返回true，失败返回false
+     */
     bool readChunk(uint32_t address, uint8_t* data, size_t len) {
         if (data == nullptr || len == 0 || len > 256) {
             setError("STM32 read chunk length invalid");
@@ -334,25 +461,44 @@ public:
     }
 
 private:
+    /**
+     * @brief 清除错误信息
+     */
     void clearError() {
         last_error_ = "";
     }
 
+    /**
+     * @brief 设置错误信息
+     * @param error 错误信息
+     */
     void setError(const String& error) {
         last_error_ = error;
         LOGE("OTA", "%s", error.c_str());
     }
 
+    /**
+     * @brief 检查是否支持指定命令
+     * @param command 命令代码
+     * @return 支持返回true，否则返回false
+     */
     bool supports(uint8_t command) const {
         return supported_commands_[command];
     }
 
+    /**
+     * @brief 清空串口输入缓冲区
+     */
     void clearInput() {
         while (serial_.available() > 0) {
             serial_.read();
         }
     }
 
+    /**
+     * @brief 从应用程序请求进入bootloader模式
+     * @return 成功返回true，失败返回false
+     */
     bool requestBootloaderFromApp() {
         serial_.flush();
         serial_.end();
@@ -397,6 +543,11 @@ private:
         return false;
     }
 
+    /**
+     * @brief 等待应用程序确认bootloader请求
+     * @param timeout_ms 超时时间（毫秒）
+     * @return 成功返回true，超时返回false
+     */
     bool waitForAppBootAck(uint32_t timeout_ms) {
         const uint32_t start_ms = millis();
         while ((millis() - start_ms) < timeout_ms) {
@@ -418,6 +569,9 @@ private:
         return false;
     }
 
+    /**
+     * @brief 配置BOOT引脚为bootloader模式
+     */
     void configureBootPinsForBootloader() {
         if (app::kStm32Boot0Pin >= 0) {
             pinMode(app::kStm32Boot0Pin, OUTPUT);
@@ -437,6 +591,10 @@ private:
         }
     }
 
+    /**
+     * @brief 配置BOOT引脚为应用程序模式
+     * @param keep_bootloader_mode 是否保持bootloader模式
+     */
     void configureBootPinsForApp(bool keep_bootloader_mode) {
         if (app::kStm32Boot1Pin >= 0) {
             digitalWrite(
@@ -450,6 +608,9 @@ private:
         }
     }
 
+    /**
+     * @brief 产生复位脉冲
+     */
     void pulseReset() {
         if (app::kStm32ResetPin < 0) {
             return;
@@ -459,6 +620,10 @@ private:
         digitalWrite(app::kStm32ResetPin, app::kStm32ResetDeassertLevel);
     }
 
+    /**
+     * @brief 与STM32 bootloader同步
+     * @return 成功返回true，失败返回false
+     */
     bool sync() {
         for (uint8_t attempt = 0; attempt < 4; ++attempt) {
             clearInput();
@@ -479,6 +644,10 @@ private:
         return false;
     }
 
+    /**
+     * @brief 获取支持的命令集
+     * @return 成功返回true，失败返回false
+     */
     bool fetchCommandSet() {
         memset(supported_commands_, 0, sizeof(supported_commands_));
         if (!sendCommand(kStm32GetCommand, app::kStm32CommandTimeoutMs, "get")) {
@@ -507,6 +676,10 @@ private:
         return true;
     }
 
+    /**
+     * @brief 获取设备ID
+     * @return 成功返回true，失败返回false
+     */
     bool fetchDeviceId() {
         if (!sendCommand(kStm32GetIdCommand, app::kStm32CommandTimeoutMs, "get id")) {
             return false;
@@ -536,6 +709,11 @@ private:
         return true;
     }
 
+    /**
+     * @brief 发送GO命令跳转到应用程序
+     * @param address 跳转地址
+     * @return 成功返回true，失败返回false
+     */
     bool sendGo(uint32_t address) {
         if (!sendCommand(kStm32GoCommand, app::kStm32CommandTimeoutMs, "go")) {
             return false;
@@ -543,6 +721,13 @@ private:
         return sendAddress(address, "go");
     }
 
+    
+    /**
+     * @brief 发送地址命令
+     * @param address 目标地址
+     * @param phase 阶段名称
+     * @return 成功返回true，失败返回false
+     */
     bool sendAddress(uint32_t address, const char* phase) {
         uint8_t frame[5] = {
             static_cast<uint8_t>((address >> 24) & 0xFF),

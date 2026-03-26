@@ -1,5 +1,15 @@
 #include "status_led.h"
 
+/**
+ * @file status_led.cpp
+ * @brief 状态LED控制实现
+ * @details 负责控制状态LED的显示，根据应用状态显示不同的颜色和效果
+ */
+
+/**
+ * @brief 构造函数，初始化状态LED
+ * @param pin LED连接的GPIO引脚号
+ */
 StatusLed::StatusLed(int pin)
     : pin_(pin),
       state_(LedState::Off),
@@ -8,6 +18,10 @@ StatusLed::StatusLed(int pin)
       initialized_(false) {
 }
 
+/**
+ * @brief 初始化LED硬件
+ * @return 初始化成功返回true
+ */
 bool StatusLed::begin() {
     if (initialized_) {
         return true;
@@ -18,6 +32,11 @@ bool StatusLed::begin() {
     return true;
 }
 
+/**
+ * @brief 设置LED状态
+ * @param state 目标LED状态
+ * @note 根据不同状态设置不同的颜色和动画效果
+ */
 void StatusLed::setState(LedState state) {
     state_ = state;
     phase_ = 0;
@@ -42,6 +61,10 @@ void StatusLed::setState(LedState state) {
     }
 }
 
+/**
+ * @brief 更新LED状态（动画效果）
+ * @note 根据当前状态和时间更新LED的显示效果，包括呼吸灯和脉冲效果
+ */
 void StatusLed::update() {
     if (!initialized_) {
         return;
@@ -115,10 +138,19 @@ void StatusLed::update() {
     }
 }
 
+/**
+ * @brief 关闭LED
+ */
 void StatusLed::off() {
     showColor(0, 0, 0);
 }
 
+/**
+ * @brief 显示指定颜色
+ * @param r 红色分量 (0-255)
+ * @param g 绿色分量 (0-255)
+ * @param b 蓝色分量 (0-255)
+ */
 void StatusLed::showColor(uint8_t r, uint8_t g, uint8_t b) {
     if (!initialized_) {
         return;

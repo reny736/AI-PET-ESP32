@@ -1,3 +1,9 @@
+/*
+ * doubao_ws_client.cpp
+ * WebSocket客户端实现，用于与Doubao API进行通信
+ * 处理WebSocket连接、消息发送和接收，包括握手、帧解析等功能
+ */
+
 #include "doubao_ws_client.h"
 
 #include <esp_heap_caps.h>
@@ -9,6 +15,11 @@
 
 namespace {
 
+/**
+ * @brief 分配PSRAM内存，如果PSRAM不可用则使用常规内存
+ * @param size 需要分配的内存大小
+ * @return 分配的内存指针，失败返回nullptr
+ */
 void* allocPsram(size_t size) {
     void* ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ptr == nullptr) {
@@ -17,6 +28,11 @@ void* allocPsram(size_t size) {
     return ptr;
 }
 
+/**
+ * @brief 将64位无符号整数转换为大端字节序
+ * @param target 目标缓冲区
+ * @param value 要转换的64位值
+ */
 void writeUint64BE(uint8_t* target, uint64_t value) {
     for (int i = 0; i < 8; ++i) {
         target[i] = static_cast<uint8_t>((value >> ((7 - i) * 8)) & 0xFF);
@@ -25,6 +41,9 @@ void writeUint64BE(uint8_t* target, uint64_t value) {
 
 }  // namespace
 
+/**
+ * @brief 构造函数，初始化WebSocket客户端
+ */
 DoubaoWsClient::DoubaoWsClient()
     : connected_(false),
       last_io_ms_(0),
@@ -42,6 +61,9 @@ DoubaoWsClient::DoubaoWsClient()
     memset(mask_key_, 0, sizeof(mask_key_));
 }
 
+/**
+ * @brief 析构函数，清理资源
+ */
 DoubaoWsClient::~DoubaoWsClient() {
     disconnect();
     if (payload_buffer_ != nullptr) {
@@ -50,6 +72,12 @@ DoubaoWsClient::~DoubaoWsClient() {
     }
 }
 
+/**
+ * @brief 初始化WebSocket客户端
+ * @param app_id 应用ID
+ * @param access_key 访问密钥
+ * @return 初始化是否成功
+ */
 bool DoubaoWsClient::begin(const char* app_id, const char* access_key) {
     app_id_ = app_id;
     access_key_ = access_key;
@@ -57,6 +85,10 @@ bool DoubaoWsClient::begin(const char* app_id, const char* access_key) {
     return true;
 }
 
+/**
+ * @brief 连接到WebSocket服务器
+ * @return 连接是否成功
+ */
 bool DoubaoWsClient::connect() {
     disconnect();
     resetParser();
@@ -81,12 +113,18 @@ bool DoubaoWsClient::connect() {
     return true;
 }
 
+/**
+ * @brief 断开WebSocket连接
+ */
 void DoubaoWsClient::disconnect() {
     connected_ = false;
     client_.stop();
     resetParser();
 }
 
+/**
+ * @brief 主循环，处理WebSocket消息
+ */
 void DoubaoWsClient::loop() {
     if (!connected_) {
         return;
@@ -110,14 +148,28 @@ void DoubaoWsClient::loop() {
     }
 }
 
+/**
+ * @brief 发送二进制数据
+ * @param data 数据指针
+ * @param len 数据长度
+ * @return 发送是否成功
+ */
 bool DoubaoWsClient::sendBinary(const uint8_t* data, size_t len) {
     return sendFrame(0x02, data, len);
 }
 
+/**
+ * @brief 检查WebSocket连接状态
+ * @return 是否连接
+ */
 bool DoubaoWsClient::isConnected() {
     return connected_ && client_.connected();
 }
 
+/**
+ * @brief 执行WebSocket握手
+ * @return 握手是否成功
+ */
 bool DoubaoWsClient::performHandshake() {
     if (!client_.connect(app::kWsHost, app::kWsPort)) {
         LOGE("WSS", "TCP connect failed");
@@ -198,6 +250,13 @@ bool DoubaoWsClient::performHandshake() {
     return true;
 }
 
+/**
+ * @brief 发送WebSocket帧
+ * @param opcode 操作码
+ * @param data 数据指针
+ * @param len 数据长度
+ * @return 发送是否成功
+ */
 bool DoubaoWsClient::sendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
     if (!isConnected()) {
         return false;
@@ -261,6 +320,10 @@ bool DoubaoWsClient::sendFrame(uint8_t opcode, const uint8_t* data, size_t len) 
     return true;
 }
 
+/**
+ * @brief 处理 incoming WebSocket帧
+ * @return 处理是否成功
+ */
 bool DoubaoWsClient::processIncomingFrame() {
     if (!frame_in_progress_) {
         while (header_bytes_read_ < 2 && client_.available() > 0) {
@@ -349,19 +412,19 @@ bool DoubaoWsClient::processIncomingFrame() {
     last_io_ms_ = millis();
 
     switch (frame_opcode_) {
-        case 0x01:
-        case 0x02:
+        case 0x01:  // 文本帧
+        case 0x02:  // 二进制帧
             if (message_callback_) {
                 message_callback_(payload_buffer_, payload_bytes_read_);
             }
             break;
-        case 0x08:
+        case 0x08:  // 关闭帧
             notifyDisconnected();
             return true;
-        case 0x09:
-            sendFrame(0x0A, payload_buffer_, payload_bytes_read_);
+        case 0x09:  // Ping帧
+            sendFrame(0x0A, payload_buffer_, payload_bytes_read_);  // 发送Pong响应
             break;
-        case 0x0A:
+        case 0x0A:  // Pong帧
         default:
             break;
     }
@@ -370,6 +433,11 @@ bool DoubaoWsClient::processIncomingFrame() {
     return true;
 }
 
+/**
+ * @brief 确保payload缓冲区有足够的容量
+ * @param size 需要的容量
+ * @return 是否成功分配内存
+ */
 bool DoubaoWsClient::ensurePayloadCapacity(size_t size) {
     if (size <= payload_capacity_) {
         return true;
@@ -392,6 +460,9 @@ bool DoubaoWsClient::ensurePayloadCapacity(size_t size) {
     return true;
 }
 
+/**
+ * @brief 重置WebSocket帧解析器
+ */
 void DoubaoWsClient::resetParser() {
     frame_in_progress_ = false;
     frame_masked_ = false;
@@ -405,6 +476,9 @@ void DoubaoWsClient::resetParser() {
     memset(mask_key_, 0, sizeof(mask_key_));
 }
 
+/**
+ * @brief 通知断开连接
+ */
 void DoubaoWsClient::notifyDisconnected() {
     const bool was_connected = connected_;
     connected_ = false;
@@ -415,6 +489,10 @@ void DoubaoWsClient::notifyDisconnected() {
     }
 }
 
+/**
+ * @brief 生成UUID
+ * @return 生成的UUID字符串
+ */
 String DoubaoWsClient::generateUuid() const {
     char buffer[48];
     const uint32_t r1 = esp_random();
@@ -434,6 +512,10 @@ String DoubaoWsClient::generateUuid() const {
     return String(buffer);
 }
 
+/**
+ * @brief 生成WebSocket密钥
+ * @return 生成的WebSocket密钥字符串
+ */
 String DoubaoWsClient::generateWebSocketKey() const {
     uint8_t raw[16];
     for (size_t i = 0; i < sizeof(raw); ++i) {

@@ -10,8 +10,18 @@
 #include "app_config.h"
 #include "logger.h"
 
+/**
+ * @file realtime_voice_app.cpp
+ * @brief 实时语音应用实现
+ * @details 负责管理整个语音助手应用的状态和流程，包括WiFi连接、API通信、会话管理、OTA更新等功能
+ */
+
 namespace {
 
+/**
+ * @brief 生成UUID字符串
+ * @return 生成的UUID字符串
+ */
 String makeUuid() {
     char buffer[48];
     const uint32_t r1 = esp_random();
@@ -31,6 +41,12 @@ String makeUuid() {
     return String(buffer);
 }
 
+/**
+ * @brief 截断并总结JSON负载
+ * @param payload JSON负载字符串
+ * @param max_len 最大长度，默认120
+ * @return 截断后的字符串
+ */
 String summarizePayload(const String& payload, size_t max_len = 120) {
     if (payload.length() <= max_len) {
         return payload;
@@ -43,6 +59,11 @@ constexpr char kOtaEsp32VersionKey[] = "esp32_ver";
 constexpr char kOtaStm32VersionKey[] = "stm32_ver";
 constexpr int kInternalMemoryPins[] = {35, 36, 37};
 
+/**
+ * @brief 从文本中提取下一个token
+ * @param text 输入文本（会被修改）
+ * @return 提取的token
+ */
 String takeToken(String& text) {
     text.trim();
     if (text.length() == 0) {
@@ -64,6 +85,11 @@ String takeToken(String& text) {
     return token;
 }
 
+/**
+ * @brief 检查对话错误是否可恢复
+ * @param payload 错误负载JSON字符串
+ * @return 可恢复返回true，否则返回false
+ */
 bool isRecoverableDialogError(const String& payload) {
     return payload.indexOf("AudioASRIdleTimeoutError") >= 0 ||
            payload.indexOf("ClientLackDataError") >= 0 ||
@@ -71,6 +97,12 @@ bool isRecoverableDialogError(const String& payload) {
            payload.indexOf("\"status_code\":\"52000030\"") >= 0;
 }
 
+/**
+ * @brief 严格解析整数
+ * @param text 输入文本
+ * @param value 输出整数值
+ * @return 解析成功返回true，失败返回false
+ */
 bool parseIntStrict(const String& text, int& value) {
     if (text.length() == 0) {
         return false;
@@ -86,6 +118,11 @@ bool parseIntStrict(const String& text, int& value) {
     return true;
 }
 
+/**
+ * @brief 获取应用状态名称
+ * @param state 应用状态
+ * @return 状态名称字符串
+ */
 const char* stateName(AppState state) {
     switch (state) {
         case AppState::Booting:
@@ -113,6 +150,11 @@ const char* stateName(AppState state) {
     }
 }
 
+/**
+ * @brief 获取默认OTA URL
+ * @param target OTA目标
+ * @return 默认URL字符串
+ */
 const char* defaultOtaUrl(OtaTarget target) {
     switch (target) {
         case OtaTarget::Esp32Self:
@@ -124,6 +166,11 @@ const char* defaultOtaUrl(OtaTarget target) {
     }
 }
 
+/**
+ * @brief 获取默认OTA SHA256校验和
+ * @param target OTA目标
+ * @return 默认SHA256字符串
+ */
 const char* defaultOtaSha256(OtaTarget target) {
     switch (target) {
         case OtaTarget::Esp32Self:
@@ -135,6 +182,11 @@ const char* defaultOtaSha256(OtaTarget target) {
     }
 }
 
+/**
+ * @brief 获取默认OTA清单URL
+ * @param target OTA目标
+ * @return 默认清单URL字符串
+ */
 const char* defaultOtaManifestUrl(OtaTarget target) {
     switch (target) {
         case OtaTarget::Esp32Self:
@@ -146,6 +198,11 @@ const char* defaultOtaManifestUrl(OtaTarget target) {
     }
 }
 
+/**
+ * @brief 获取编译时的OTA版本
+ * @param target OTA目标
+ * @return 编译时版本字符串
+ */
 const char* compiledOtaVersion(OtaTarget target) {
     switch (target) {
         case OtaTarget::Esp32Self:
@@ -157,6 +214,11 @@ const char* compiledOtaVersion(OtaTarget target) {
     }
 }
 
+/**
+ * @brief 获取OTA版本存储键名
+ * @param target OTA目标
+ * @return 键名字符串
+ */
 const char* otaVersionKey(OtaTarget target) {
     switch (target) {
         case OtaTarget::Esp32Self:
@@ -168,11 +230,22 @@ const char* otaVersionKey(OtaTarget target) {
     }
 }
 
+/**
+ * @brief 去除字符串首尾空白并返回副本
+ * @param value 输入字符串
+ * @return 处理后的字符串副本
+ */
 String trimCopy(String value) {
     value.trim();
     return value;
 }
 
+/**
+ * @brief 获取当前OTA版本
+ * @param target OTA目标
+ * @return 当前版本字符串
+ * @note 优先从Preferences读取，否则返回编译时版本
+ */
 String currentOtaVersion(OtaTarget target) {
     Preferences prefs;
     if (prefs.begin(kOtaPrefsNamespace, false)) {
@@ -189,6 +262,11 @@ String currentOtaVersion(OtaTarget target) {
     return trimCopy(String(compiledOtaVersion(target)));
 }
 
+/**
+ * @brief 检查引脚是否为板载保留引脚
+ * @param pin 引脚号
+ * @return 是保留引脚返回true，否则返回false
+ */
 bool isBoardReservedPin(int pin) {
     for (const int reserved_pin : kInternalMemoryPins) {
         if (pin == reserved_pin) {
@@ -198,6 +276,12 @@ bool isBoardReservedPin(int pin) {
     return false;
 }
 
+/**
+ * @brief 保存已安装的OTA版本
+ * @param target OTA目标
+ * @param version 版本字符串
+ * @return 保存成功返回true，失败返回false
+ */
 bool saveInstalledOtaVersion(OtaTarget target, const String& version) {
     const String normalized = trimCopy(version);
     if (normalized.length() == 0) {
@@ -214,6 +298,11 @@ bool saveInstalledOtaVersion(OtaTarget target, const String& version) {
     return ok;
 }
 
+/**
+ * @brief 构建绝对OTA URL
+ * @param value 输入URL或相对路径
+ * @return 绝对URL字符串
+ */
 String makeAbsoluteOtaUrl(const String& value) {
     if (value.startsWith("http://") || value.startsWith("https://")) {
         return value;
@@ -230,16 +319,28 @@ String makeAbsoluteOtaUrl(const String& value) {
     return String(app::kOtaServerBaseUrl) + "/" + value;
 }
 
+/**
+ * @struct OtaRequestResolution
+ * @brief OTA请求解析结果结构体
+ * @details 存储从清单或默认配置解析出的OTA更新信息
+ */
 struct OtaRequestResolution {
-    String url;
-    String sha256;
-    String version;
-    String md5;
-    String update_log;
-    bool manifest_used = false;
-    bool already_latest = false;
+    String url;              // 固件下载URL
+    String sha256;           // SHA256校验和
+    String version;          // 固件版本号
+    String md5;              // MD5校验和（可选）
+    String update_log;       // 更新日志
+    bool manifest_used = false;  // 是否使用了清单文件
+    bool already_latest = false; // 是否已是最新版本
 };
 
+/**
+ * @brief 从清单文件获取OTA更新信息
+ * @param target OTA目标设备
+ * @param resolution 输出的解析结果
+ * @param error 错误信息
+ * @return 解析成功返回true，失败返回false
+ */
 bool fetchManifestResolution(
     OtaTarget target,
     OtaRequestResolution& resolution,
