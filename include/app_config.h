@@ -33,7 +33,7 @@
 #endif
 
 #ifndef OTA_SERVER_BASE_URL
-#define OTA_SERVER_BASE_URL "http://172.20.10.2:8080"  // OTA服务器基础URL
+#define OTA_SERVER_BASE_URL "-------"  // OTA服务器基础URL
 #endif
 
 #ifndef OTA_ESP32_MANIFEST_URL
