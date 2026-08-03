@@ -4,7 +4,9 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_idf_version.h>
 #include <esp_random.h>
+#include <esp_task_wdt.h>
 #include <stdlib.h>
 
 #include "app_config.h"
@@ -466,6 +468,7 @@ RealtimeVoiceApp::RealtimeVoiceApp()
       ota_stm32_button_raw_(false),
       ota_esp32_button_pressed_(false),
       ota_stm32_button_pressed_(false),
+      watchdog_enabled_(false),
       reconnect_at_ms_(0),
       last_audio_rx_ms_(0),
       last_tts_ended_ms_(0),
@@ -475,7 +478,8 @@ RealtimeVoiceApp::RealtimeVoiceApp()
       ota_mode_started_ms_(0),
       ota_last_attempt_ms_(0),
       ota_esp32_button_changed_ms_(0),
-      ota_stm32_button_changed_ms_(0) {
+      ota_stm32_button_changed_ms_(0),
+      last_watchdog_feed_ms_(0) {
     session_config_.bot_name = app::kBotName;
     session_config_.system_role = app::kSystemRole;
     session_config_.speaking_style = app::kSpeakingStyle;
@@ -508,6 +512,7 @@ bool RealtimeVoiceApp::begin() {
         "versions esp32=%s stm32=%s",
         installed_esp32_version.c_str(),
         installed_stm32_version.c_str());
+    beginWatchdog();
 
     led_.begin();
     setState(AppState::Booting);
@@ -553,6 +558,7 @@ void RealtimeVoiceApp::loop() {
         led_.update();
         serviceSerialCommands();
         serviceOtaMode();
+        feedWatchdog();
         delay(1);
         return;
     }
@@ -567,7 +573,53 @@ void RealtimeVoiceApp::loop() {
     reconnectIfNeeded();
     printMonitor();
 
+    feedWatchdog();
     delay(1);
+}
+
+bool RealtimeVoiceApp::beginWatchdog() {
+#if ESP_IDF_VERSION_MAJOR >= 5
+    esp_task_wdt_config_t config = {
+        .timeout_ms = app::kWatchdogTimeoutMs,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    const esp_err_t init_err = esp_task_wdt_init(&config);
+#else
+    const esp_err_t init_err =
+        esp_task_wdt_init((app::kWatchdogTimeoutMs + 999UL) / 1000UL, true);
+#endif
+
+    if (init_err != ESP_OK && init_err != ESP_ERR_INVALID_STATE) {
+        LOGW("WDT", "Task watchdog init failed: %d", init_err);
+        return false;
+    }
+
+    const esp_err_t add_err = esp_task_wdt_add(nullptr);
+    if (add_err != ESP_OK && add_err != ESP_ERR_INVALID_STATE) {
+        LOGW("WDT", "Task watchdog subscribe failed: %d", add_err);
+        return false;
+    }
+
+    watchdog_enabled_ = true;
+    feedWatchdog(true);
+    LOGI("WDT", "Task watchdog enabled timeout=%u ms", static_cast<unsigned>(app::kWatchdogTimeoutMs));
+    return true;
+}
+
+void RealtimeVoiceApp::feedWatchdog(bool force) {
+    if (!watchdog_enabled_) {
+        return;
+    }
+
+    const uint32_t now = millis();
+    if (!force && (now - last_watchdog_feed_ms_) < app::kWatchdogFeedIntervalMs) {
+        return;
+    }
+
+    if (esp_task_wdt_reset() == ESP_OK) {
+        last_watchdog_feed_ms_ = now;
+    }
 }
 
 bool RealtimeVoiceApp::connectWiFi() {
@@ -587,6 +639,7 @@ bool RealtimeVoiceApp::connectWiFi() {
     const uint32_t start_ms = millis();
     while (WiFi.status() != WL_CONNECTED &&
            (millis() - start_ms) < app::kWifiConnectTimeoutMs) {
+        feedWatchdog();
         delay(250);
     }
 

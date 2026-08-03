@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <esp_task_wdt.h>
 #include <mbedtls/sha256.h>
 
 #include <string.h>
@@ -20,6 +21,10 @@
  */
 
 namespace {
+
+void feedTaskWatchdog() {
+    esp_task_wdt_reset();
+}
 
 constexpr char kStagingPath[] = "/stm32_ota.bin";
 constexpr uint8_t kStm32Ack = 0x79;
@@ -551,6 +556,7 @@ private:
     bool waitForAppBootAck(uint32_t timeout_ms) {
         const uint32_t start_ms = millis();
         while ((millis() - start_ms) < timeout_ms) {
+            feedTaskWatchdog();
             if (serial_.available() <= 0) {
                 delay(1);
                 continue;
@@ -772,6 +778,7 @@ private:
         size_t offset = 0;
         const uint32_t start_ms = millis();
         while (offset < len && (millis() - start_ms) < timeout_ms) {
+            feedTaskWatchdog();
             if (serial_.available() <= 0) {
                 delay(1);
                 continue;
@@ -904,6 +911,7 @@ bool downloadToFile(
     uint32_t last_progress_ms = 0;
 
     while (total < static_cast<size_t>(content_length)) {
+        feedTaskWatchdog();
         const size_t available = stream.available();
         if (available == 0) {
             if ((millis() - last_data_ms) > app::kOtaHttpTimeoutMs) {
@@ -993,6 +1001,7 @@ bool streamEsp32Update(
     uint32_t last_progress_ms = 0;
 
     while (total < static_cast<size_t>(content_length)) {
+        feedTaskWatchdog();
         const size_t available = stream.available();
         if (available == 0) {
             if ((millis() - last_data_ms) > app::kOtaHttpTimeoutMs) {
@@ -1063,6 +1072,7 @@ bool writeStm32File(Stm32Bootloader& bootloader, File& image, size_t image_size)
     size_t written = 0;
 
     while (remaining > 0) {
+        feedTaskWatchdog();
         const size_t raw_len = min(sizeof(buffer), remaining);
         const size_t read = image.read(buffer, raw_len);
         if (read != raw_len) {
@@ -1105,6 +1115,7 @@ bool verifyStm32File(Stm32Bootloader& bootloader, File& image, size_t image_size
     size_t verified = 0;
 
     while (remaining > 0) {
+        feedTaskWatchdog();
         const size_t raw_len = min(sizeof(expected), remaining);
         const size_t read = image.read(expected, raw_len);
         if (read != raw_len) {

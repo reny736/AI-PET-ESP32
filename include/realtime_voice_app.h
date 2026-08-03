@@ -73,6 +73,18 @@ private:
      * @return 初始化成功返回true，失败返回false
      */
     bool beginAuxSerial();
+
+    /**
+     * @brief 初始化应用看门狗
+     * @return 初始化成功返回true，失败返回false
+     */
+    bool beginWatchdog();
+
+    /**
+     * @brief 喂应用看门狗
+     * @param force 是否忽略喂狗间隔立即喂狗
+     */
+    void feedWatchdog(bool force = false);
     
     /**
      * @brief 初始化OTA按钮
@@ -328,6 +340,7 @@ private:
     bool ota_stm32_button_raw_;  // STM32 OTA按钮原始状态
     bool ota_esp32_button_pressed_;  // ESP32 OTA按钮是否按下
     bool ota_stm32_button_pressed_;  // STM32 OTA按钮是否按下
+    bool watchdog_enabled_;  // 看门狗是否启用
     String deferred_reconnect_reason_;  // 延迟重连原因
 
     uint32_t reconnect_at_ms_;  // 重连时间
@@ -340,5 +353,6 @@ private:
     uint32_t ota_last_attempt_ms_;  // 最后一次OTA尝试时间
     uint32_t ota_esp32_button_changed_ms_;  // ESP32 OTA按钮最后一次变化时间
     uint32_t ota_stm32_button_changed_ms_;  // STM32 OTA按钮最后一次变化时间
+    uint32_t last_watchdog_feed_ms_;  // 上次喂狗时间
     String serial_command_buffer_;  // 串口命令缓冲区
 };

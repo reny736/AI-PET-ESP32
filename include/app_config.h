@@ -96,6 +96,14 @@
 #define OTA_BUTTON_ACTIVE_LEVEL LOW  // OTA按钮激活电平
 #endif
 
+#ifndef APP_WATCHDOG_TIMEOUT_MS
+#define APP_WATCHDOG_TIMEOUT_MS 30000  // 应用看门狗超时时间（毫秒）
+#endif
+
+#ifndef APP_WATCHDOG_FEED_INTERVAL_MS
+#define APP_WATCHDOG_FEED_INTERVAL_MS 1000  // 应用看门狗喂狗间隔（毫秒）
+#endif
+
 #ifndef OTA_ESP32_BUTTON_PIN
 #define OTA_ESP32_BUTTON_PIN 38  // ESP32 OTA按钮引脚
 #endif
@@ -322,6 +330,8 @@ constexpr uint32_t kWsKeepAliveMs = 15000;  // WebSocket保持连接时间（毫
 constexpr uint32_t kReconnectDelayMs = 3000;  // 重连延迟时间（毫秒）
 constexpr uint32_t kMonitorIntervalMs = 5000;  // 监控间隔时间（毫秒）
 constexpr uint32_t kAudioStatsIntervalMs = 3000;  // 音频统计间隔时间（毫秒）
+constexpr uint32_t kWatchdogTimeoutMs = APP_WATCHDOG_TIMEOUT_MS;  // 看门狗超时时间（毫秒）
+constexpr uint32_t kWatchdogFeedIntervalMs = APP_WATCHDOG_FEED_INTERVAL_MS;  // 看门狗喂狗间隔（毫秒）
 
 // OTA配置
 constexpr uint32_t kOtaHttpTimeoutMs = OTA_HTTP_TIMEOUT_MS;  // OTA HTTP超时时间（毫秒）
